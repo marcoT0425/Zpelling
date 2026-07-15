@@ -18,9 +18,23 @@ nltk.download('cmudict', quiet=True)
 
 from nltk.corpus import wordnet as wn
 from nltk.corpus import cmudict
+from nltk.metrics.distance import edit_distance
 
-# Initialize CMU Pronunciation Dictionary
-d_pronounce = cmudict.dict()
+# Initialise CMU Pronunciation Dictionary
+try:
+    d_pronounce = cmudict.dict()
+except LookupError:
+    # Fallback if cmudict downloading failed or needs explicit loading
+    nltk.download('cmudict')
+    d_pronounce = cmudict.dict()
+
+print("Optimizing WordNet vocabulary index for fast typo-correction...")
+# Pre-compile a flat vocabulary list of all lowercase WordNet lemmas for instant access
+WORDNET_VOCAB = set()
+for synset in wn.all_synsets():
+    for lemma in synset.lemmas():
+        WORDNET_VOCAB.add(lemma.name().replace('_', ' ').lower())
+WORDNET_VOCAB = sorted(list(WORDNET_VOCAB))
 
 
 def strip_diacritics(text):
@@ -43,28 +57,22 @@ def get_phonetics(word):
 
 
 def is_legitimate_spelling_variant(target, candidate):
-    """
-    Linguistically verifies if a candidate word is a true alternative spelling
-    of the target word, blocking unrelated synonyms, derivatives, and phrases.
-    """
+    """Linguistically verifies if a candidate word is a true alternative spelling."""
     t_l = target.lower().strip()
     c_l = candidate.lower().strip()
 
     if t_l == c_l:
         return True
 
-    # Guard: If one has spaces/hyphens and the other doesn't, they must be compound variants
     if (' ' in t_l or ' ' in c_l) and t_l.replace(' ', '') != c_l.replace(' ', ''):
         return False
 
     t_flat = get_flattened_baseline(t_l)
     c_flat = get_flattened_baseline(c_l)
 
-    # 1. Accent, hyphen, or spacing variations of the exact same word
     if t_flat == c_flat:
         return True
 
-    # 2. Regional suffix variations (-or/-our, -ize/-ise, -er/-re, -og/-ogue)
     suffix_pairs = [
         ('or', 'our'), ('our', 'or'),
         ('ize', 'ise'), ('ise', 'ize'),
@@ -76,7 +84,6 @@ def is_legitimate_spelling_variant(target, candidate):
             if t_l[:-len(s1)] == c_l[:-len(s2)]:
                 return True
 
-    # 3. Consonant doubling variations (traveler/traveller)
     if len(t_l) != len(c_l):
         if t_l.replace('l', 'll') == c_l or c_l.replace('l', 'll') == t_l:
             return True
@@ -88,47 +95,42 @@ def dynamic_corpus_tagger(w1, w2):
     """Programmatically applies frequency and regional taxonomy labels."""
     w1_l, w2_l = w1.lower(), w2.lower()
 
-    # -er vs -re regional swaps (e.g., center vs centre)
     if (w1_l.endswith('er') and w2_l.endswith('re')) or (w1_l.endswith('re') and w2_l.endswith('er')):
         er_form = w1_l if w1_l.endswith('er') else w2_l
         re_form = w1_l if w1_l.endswith('re') else w2_l
         return {er_form: "[=] (AmE)", re_form: "[=] (BrE)"}
 
-    # -or vs -our regional swaps (e.g., color vs colour)
     if (w1_l.endswith('or') and w2_l.endswith('our')) or (w1_l.endswith('our') and w2_l.endswith('or')):
         or_form = w1_l if w1_l.endswith('or') else w2_l
         our_form = w1_l if w1_l.endswith('our') else w2_l
         return {or_form: "[==] (AmE)", our_form: "[==] (BrE)"}
 
-    # -ize vs -ise regional swaps (e.g., organize vs organise)
     if (w1_l.endswith('ize') and w2_l.endswith('ise')) or (w1_l.endswith('ise') and w2_l.endswith('ize')):
         ize_form = w1_l if w1_l.endswith('ize') else w2_l
         ise_form = w1_l if w1_l.endswith('ise') else w2_l
         return {ize_form: "[C] (AmE)", ise_form: "[C] (BrE)"}
 
-    # Hyphen variations
     if w1_l.replace('-', '') == w2_l.replace('-', ''):
-        hyphen_form = w1_l if '-' in w1_l else w2_l
+        hypor_form = w1_l if '-' in w1_l else w2_l
         flat_form = w1_l if '-' not in w1_l else w2_l
-        return {flat_form: "[=]", hyphen_form: "[=]"}
+        return {flat_form: "[=]", hypor_form: "[=]"}
 
     return {w1_l: "[=]", w2_l: "[=]"}
 
 
 def query_dynamic_dictionary(search_term):
-    """Executes search queries with structural filtering to block false synonyms."""
+    """Executes searches with structural normalization and interactive typo handling."""
     term_lower = search_term.lower().strip()
     wordnet_key = term_lower.replace(' ', '_')
     synsets = wn.synsets(wordnet_key)
 
-    redirected = False
+    redirect_message = ""
     original_search = term_lower
 
-    # 📌 RECURSIVE REDIRECTION LAYER
+    # 📌 1. RECURSIVE EXACT BASELINE REDIRECTION (For true hidden unhyphenated standards)
     if not synsets:
         search_flat = get_flattened_baseline(term_lower)
         found_redirect = False
-
         for syn in wn.all_synsets():
             for lemma in syn.lemmas():
                 lemma_clean = lemma.name().replace('_', ' ')
@@ -136,28 +138,70 @@ def query_dynamic_dictionary(search_term):
                     wordnet_key = lemma.name()
                     term_lower = lemma_clean
                     synsets = wn.synsets(wordnet_key)
-                    redirected = True
+                    redirect_message = f"🔀 Exact Structural Redirect: '{original_search}' ➔ '{term_lower}'"
                     found_redirect = True
                     break
             if found_redirect:
                 break
 
+    # 📌 2. INTELLIGENT TYPO-CORRECTION & INTERACTIVE MATRIX LAYER
+    if not synsets:
+        # Pre-filter lexicon space by length step limits to optimse performance
+        len_candidates = [w for w in WORDNET_VOCAB if abs(len(w) - len(term_lower)) <= 2]
+        best_matches = []
+        min_dist = 999
+
+        for cand in len_candidates:
+            dist = edit_distance(term_lower, cand)
+            if dist < min_dist:
+                min_dist = dist
+                best_matches = [cand]
+            elif dist == min_dist:
+                best_matches.append(cand)
+
+        # Only process high-confidence adjustments (edit distance 1 or 2)
+        if min_dist <= 2 and best_matches:
+            if len(best_matches) == 1:
+                # Type A: Highly certain single choice typo -> Auto-redirect
+                term_lower = best_matches[0]
+                wordnet_key = term_lower.replace(' ', '_')
+                synsets = wn.synsets(wordnet_key)
+                redirect_message = f"🔧 Autocorrected Typo: '{original_search}' ➔ '{term_lower}'"
+            else:
+                # Type B: Uncertain ambiguous typo -> Prompt user selection menu
+                print(f"\n❓ Uncertain term entry. Did you mean one of these for '{original_search}'?")
+                choices_preview = best_matches[:10]  # Cap interactive view at 10 items
+                for idx, cand in enumerate(choices_preview, 1):
+                    print(f"   {idx}. {cand}")
+                print("   0. None of the above (Skip correction)")
+
+                try:
+                    selection = input("\nSelect a menu option number: ").strip()
+                    if selection.isdigit() and 1 <= int(selection) <= len(choices_preview):
+                        term_lower = choices_preview[int(selection) - 1]
+                        wordnet_key = term_lower.replace(' ', '_')
+                        synsets = wn.synsets(wordnet_key)
+                        redirect_message = f"Interactive Selection: Mapped to '{term_lower}'"
+                    else:
+                        print("❌ Correction bypassed.")
+                except (KeyboardInterrupt, SystemExit):
+                    return
+
+    # Print clean formatted results block
     print("\n" + "=" * 80)
     print(f"🔍 SEARCH RESULTS FOR: '{original_search.upper()}'")
     print("=" * 80)
     print(f"🎙️ Phonetics (ARPAbet): {get_phonetics(term_lower)}")
     print("-" * 80)
 
-    if redirected:
-        print(f"🔀 WordNet Redirection: Variant spelling structure not found natively.")
-        print(f"   Redirected input form: '{original_search}' ----> root form: '{term_lower}'\n")
+    if redirect_message:
+        print(f"{redirect_message}\n")
 
-    # Discover and FILTER synonyms out from the current Synset concept pool
+    # Discover and clean variants array
     all_discovered_variants = set()
     for syn in synsets:
         for lemma in syn.lemmas():
             lemma_clean = lemma.name().replace('_', ' ')
-            # STRICT GUARD: Only accept true spelling variants, drop generic synonyms like 'tinge'
             if is_legitimate_spelling_variant(term_lower, lemma_clean):
                 all_discovered_variants.add(lemma_clean)
 
@@ -165,7 +209,7 @@ def query_dynamic_dictionary(search_term):
     all_discovered_variants.add(original_search)
     sorted_variants = sorted(list(all_discovered_variants), key=lambda x: (x.lower(), x))
 
-    # Generate dynamic custom tags
+    # Render layout labels tracking variables dynamically
     display_tags = {}
     if len(sorted_variants) >= 2:
         for i in range(len(sorted_variants)):
@@ -181,12 +225,11 @@ def query_dynamic_dictionary(search_term):
     else:
         display_variants_str = f"{term_lower} [=]"
 
-    # Print clean block mapping
     print(f"{original_search}\n")
     print(f"variants: {display_variants_str}")
     print("-" * 80)
 
-    # Output definitions
+    # Render word meanings
     if synsets:
         print(f"💡 MEANINGS & SENTENCE EXAMPLES (WordNet Reference Target: '{term_lower.upper()}'):")
         pos_names = {'n': 'Noun', 'v': 'Verb', 'a': 'Adjective', 'r': 'Adverb', 's': 'Adjective Satellite'}
@@ -200,19 +243,22 @@ def query_dynamic_dictionary(search_term):
 
 
 if __name__ == "__main__":
-    print("\n--- Cleaned Variant Redirection Engine Initialized ---")
+    print("\n--- Autocorrecting Variant Redirection Engine Initialised ---")
     print("Type 'exit' into the prompt to terminate the dictionary application.\n")
 
     while True:
         try:
             word_query = input("Enter an English word to analyse its meanings: ")
+
             if word_query.lower().strip() == 'exit':
                 print("Closing system framework.")
                 break
+
             if word_query.strip():
                 query_dynamic_dictionary(word_query)
             else:
                 print("⚠️ Warning: Input stream cannot be blank.")
+
         except (KeyboardInterrupt, SystemExit):
             print("\nApplication closed.")
             break
